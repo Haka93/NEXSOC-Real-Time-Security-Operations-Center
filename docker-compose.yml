@@ -1,0 +1,180 @@
+# ============================================================
+# NEXSOC — Full Wazuh SOC Stack for Windows 11/10
+# Wazuh 4.7 | OpenSearch 2.x | Dashboard
+# ============================================================
+# REQUIREMENTS: Docker Desktop for Windows (WSL2 backend)
+#   RAM: 6GB minimum assigned to Docker
+#   Disk: 20GB free
+# ============================================================
+
+version: '3.8'
+
+services:
+
+  # ─────────────────────────────────────────────
+  # 1. Wazuh Manager — Core SIEM engine
+  # ─────────────────────────────────────────────
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.7.3
+    hostname: wazuh.manager
+    container_name: wazuh-manager
+    restart: always
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 655360
+        hard: 655360
+    ports:
+      - "1514:1514/udp"        # Agent communication (UDP)
+      - "1514:1514/tcp"        # Agent communication (TCP)
+      - "1515:1515"            # Agent enrollment
+      - "514:514/udp"          # Syslog ingestion
+      - "514:514/tcp"          # Syslog ingestion (TCP)
+      - "55000:55000"          # Wazuh API
+    environment:
+      - INDEXER_URL=https://wazuh.indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:-SecureP@ss2024!}
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat.key
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${API_PASSWORD:-SecureP@ss2024!}
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - filebeat_etc:/etc/filebeat
+      - filebeat_var:/var/lib/filebeat
+      - ./config/wazuh/ossec/ossec.conf:/var/ossec/etc/ossec.conf
+      - ./config/wazuh/rules/:/var/ossec/etc/rules/
+      - ./config/wazuh/decoders/:/var/ossec/etc/decoders/
+      - wazuh_ssl_certs:/etc/ssl:ro
+    networks:
+      - soc-net
+    depends_on:
+      wazuh.indexer:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────
+  # 2. Wazuh Indexer — OpenSearch (data store)
+  # ─────────────────────────────────────────────
+  wazuh.indexer:
+    image: wazuh/wazuh-indexer:4.7.3
+    hostname: wazuh.indexer
+    container_name: wazuh-indexer
+    restart: always
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:-SecureP@ss2024!}
+      - bootstrap.memory_lock=true
+      - cluster.name=wazuh-cluster
+      - node.name=wazuh.indexer
+      - discovery.type=single-node
+      - network.host=0.0.0.0
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      - wazuh_ssl_certs:/usr/share/wazuh-indexer/certs:ro
+      - ./config/wazuh/indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/opensearch.yml
+      - ./config/wazuh/indexer/internal_users.yml:/usr/share/wazuh-indexer/opensearch-security/internal_users.yml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -ku admin:${INDEXER_PASSWORD:-SecureP@ss2024!} https://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - soc-net
+
+  # ─────────────────────────────────────────────
+  # 3. Wazuh Dashboard — Kibana-style web UI
+  # ─────────────────────────────────────────────
+  wazuh.dashboard:
+    image: wazuh/wazuh-dashboard:4.7.3
+    hostname: wazuh.dashboard
+    container_name: wazuh-dashboard
+    restart: always
+    ports:
+      - "443:5601"             # Access at https://localhost
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${INDEXER_PASSWORD:-SecureP@ss2024!}
+      - WAZUH_API_URL=https://wazuh.manager
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-SecureP@ss2024!}
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${API_PASSWORD:-SecureP@ss2024!}
+    volumes:
+      - wazuh_ssl_certs:/usr/share/wazuh-dashboard/certs:ro
+      - wazuh-dashboard-config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - wazuh-dashboard-custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+      - ./config/wazuh/dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml
+    networks:
+      - soc-net
+    depends_on:
+      wazuh.indexer:
+        condition: service_healthy
+      wazuh.manager:
+        condition: service_started
+
+  # ─────────────────────────────────────────────
+  # 4. SSL Certificate Generator (runs once)
+  # ─────────────────────────────────────────────
+  wazuh-certs-generator:
+    image: wazuh/wazuh-certs-generator:0.0.2
+    hostname: wazuh-certs-generator
+    container_name: wazuh-certs-generator
+    volumes:
+      - wazuh_ssl_certs:/certificates
+      - ./config/wazuh/certs.yml:/config/certs.yml
+    networks:
+      - soc-net
+
+# ─────────────────────────────────────────────
+# Volumes
+# ─────────────────────────────────────────────
+volumes:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  filebeat_etc:
+  filebeat_var:
+  wazuh-indexer-data:
+  wazuh-dashboard-config:
+  wazuh-dashboard-custom:
+  wazuh_ssl_certs:
+
+# ─────────────────────────────────────────────
+# Network
+# ─────────────────────────────────────────────
+networks:
+  soc-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
